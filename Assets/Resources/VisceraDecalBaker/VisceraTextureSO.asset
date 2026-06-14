@@ -1,0 +1,40 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 2561644d148794bd4ab563933e78b63b, type: 3}
+  m_Name: VisceraTextureSO
+  m_EditorClassIdentifier: 
+  atlasTexture: {fileID: 2800000, guid: 639d961aa40ea4675bab91e716785d3e, type: 3}
+  entries:
+  - atlasIndex: 0
+    uvOffset: {x: 0.00024414062, y: 0.00024414062}
+    uvSize: {x: 0.25, y: 0.25}
+  - atlasIndex: 1
+    uvOffset: {x: 0.25073242, y: 0.00024414062}
+    uvSize: {x: 0.25, y: 0.25}
+  - atlasIndex: 2
+    uvOffset: {x: 0.5012207, y: 0.00024414062}
+    uvSize: {x: 0.25, y: 0.25}
+  - atlasIndex: 3
+    uvOffset: {x: 0.00024414062, y: 0.25073242}
+    uvSize: {x: 0.25, y: 0.25}
+  - atlasIndex: 4
+    uvOffset: {x: 0.00024414062, y: 0.5012207}
+    uvSize: {x: 0.25, y: 0.25}
+  - atlasIndex: 5
+    uvOffset: {x: 0.25073242, y: 0.25073242}
+    uvSize: {x: 0.25, y: 0.25}
+  - atlasIndex: 6
+    uvOffset: {x: 0.5012207, y: 0.25073242}
+    uvSize: {x: 0.25, y: 0.25}
+  - atlasIndex: 7
+    uvOffset: {x: 0.25073242, y: 0.5012207}
+    uvSize: {x: 0.25, y: 0.25}

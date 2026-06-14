@@ -1,0 +1,143 @@
+#pragma kernel StepKernel
+#pragma kernel SolveKernel
+#pragma kernel PinnedKernel
+#pragma kernel UnpinnKernel
+#pragma kernel GravityKernel
+
+struct PBDNode
+{
+    float3 position;
+    float3 prevPosition;
+    float decay;
+    int pinned;
+};
+StructuredBuffer<PBDNode> _NodesBufferInput;
+RWStructuredBuffer<PBDNode> _NodesBufferOutput;
+
+struct PBDDamper
+{
+    int startNode;
+    int endNode;
+    float length;  
+};
+StructuredBuffer<PBDDamper> _DampersBuffer;
+
+struct PBDPin
+{
+  int active;
+  int pinID;
+  float3 position;
+};
+StructuredBuffer<PBDPin> _PinBuffer;
+
+cbuffer SimulationProperties //:register(b0)
+{
+  int _NodesCount, _DampersCount;
+  float _DeltaTime,_Decay;
+  float3 _Gravity;
+}
+
+// This is verlet integration : xₙ₊₁ = xₙ + (xₙ - xₙ₋₁) * damping + a * dt² (a * dt^2 is gravity which is in seperate kernel)
+[numthreads(8, 1, 1)]
+void StepKernel(uint3 id : SV_DispatchThreadID)
+{
+  int idx = id.x;
+  if((int)idx >= _NodesCount) return;
+  
+  PBDNode n = _NodesBufferInput[idx];
+
+  float3 v = n.position - n.prevPosition;
+  float3 next = n.position + v * n.decay * _Decay;
+  n.prevPosition = n.position;
+  n.position = next;
+
+  _NodesBufferOutput[idx] = n;
+}
+
+
+float3 compute_delta(PBDDamper e)
+{
+  PBDNode a = _NodesBufferInput[e.startNode];
+  PBDNode b = _NodesBufferInput[e.endNode];
+  float3 delta = a.position - b.position;
+  float dist = length(delta);
+  float3 n = normalize(delta);
+  
+  float dirNorm = (dist - e.length);
+  if (isnan(dirNorm) || isinf(dirNorm))
+  {
+    return 0;
+  }
+  // return dirNorm * delta * 0.5;//0.5 is because a will move half way and b will move halfway 
+  return n * dirNorm * 0.5f;
+}
+
+[numthreads(8, 1, 1)]
+void SolveKernel(uint3 id : SV_DispatchThreadID)
+{
+  int idx = id.x;
+  if((int)idx >= _NodesCount) return;
+
+  PBDNode n = _NodesBufferInput[idx];
+  
+  if(!n.pinned)
+  {
+    for(int i = 0;i < _DampersCount;i++)
+    {
+      PBDDamper d = _DampersBuffer[i];
+      if(d.startNode == idx)
+      {
+        n.position -= compute_delta(d);
+      }
+      else if(d.endNode == idx)        
+      {
+        n.position += compute_delta(d);
+      }
+    }
+  }
+  _NodesBufferOutput[idx] = n;
+}
+[numthreads(8,1,1)]
+void PinnedKernel(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    if (idx >= _NodesCount) return;
+
+    PBDNode n = _NodesBufferInput[idx];
+    PBDPin p = _PinBuffer[idx];
+
+    if (p.active != 0)
+    {
+        n.position = p.position;
+        n.prevPosition = p.position;
+        n.pinned = 1;
+    }
+    else
+    {
+        n.pinned = 0;
+    }
+
+    _NodesBufferOutput[idx] = n;
+}
+
+[numthreads(8, 1, 1)]
+void UnpinnKernel(uint3 id : SV_DispatchThreadID)
+{
+  if((int)id.x >= _NodesCount) return;
+
+  int idx = id.x;
+  PBDNode n = _NodesBufferInput[idx];
+  n.pinned = false;
+  _NodesBufferOutput[idx] = n;
+}
+
+[numthreads(8, 1, 1)]
+void GravityKernel(uint3 id : SV_DispatchThreadID)
+{
+  if((int)id.x >= _NodesCount) return;
+
+  int idx = id.x;
+  PBDNode n = _NodesBufferInput[idx];
+  n.position += _Gravity * _DeltaTime * (!n.pinned);
+  _NodesBufferOutput[idx] = n;
+}

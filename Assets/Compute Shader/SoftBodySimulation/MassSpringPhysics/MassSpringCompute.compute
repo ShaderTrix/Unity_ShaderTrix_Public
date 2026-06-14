@@ -1,0 +1,399 @@
+#pragma kernel CalculateAndApplySpringForce
+#pragma kernel ResolveCollisions
+
+// Assume: we can ask for each spring node which spring dampers apply forces on it.
+// Then we can calculate the total forces and integrate in parallell for each spring node.
+// The id in the compute shader main function will be the id of the spring node.
+struct Slice {
+    uint Start, End;
+};
+
+struct IntegrationEquationVariables {
+    float3 Position; 
+    float3 Velocity; 
+};
+
+struct SpringNodeInput
+{
+    Slice _SpringDamperBuffer;
+    IntegrationEquationVariables PhysicsVariables;
+    float Radius;
+    int isPinned;
+    float3 PinnedPos;
+};
+
+struct SpringNodeOutput
+{
+    IntegrationEquationVariables PhysicsVariables;
+};
+
+struct SpringDamper {
+    uint OtherNodeId;
+    float DesiredDistance;
+    float SpringConstant;
+};
+
+struct Cuboid {
+    float3 Center,HalfSize;
+    float4x4 Orientation;
+};
+struct Sphere {
+    float3 Position;
+    float Radius;
+};
+
+StructuredBuffer<SpringDamper> _SpringDamperBuffer;
+StructuredBuffer<SpringNodeInput> _SpringNodesBuffer;
+RWStructuredBuffer<SpringNodeOutput> _SpringNodesOutputBuffer;
+
+StructuredBuffer<Cuboid> _BoxCollidersBuffer;
+uint _BoxCollidersCount;
+StructuredBuffer<Sphere> _SpheresColliderBuffer;
+uint _SphereColliderCount;
+
+
+float3 _Gravity;
+float _InverseMass; //1/mass because when mass is small force will be greater and visa versa..now we dont use mass directly because it can become infinite
+float _DeltaTime;
+float _RestitutionConstant; //bounciness 0 = no bounce 1 = perfect bounce
+float _FrictionConstant;
+uint _DeltaTimeDeltaTimeDivisor;
+uint _SpringNodeCount;
+float _SpringDamping;
+
+float3 _WindDir;
+half _WindStrength,_WindSpatialScale,_Time;
+
+/**
+ * This is the function f = dy/dt that is used in the RK4 description.
+ * Note that this function is independent of the time, hence no time parameter is provided.
+ * @param velocity The velocity value in the equation.
+ * @param acceleration The current acceleration we want to apply on the existing system.
+ * @return The position and velocity variables derived with respect to time.
+ */
+IntegrationEquationVariables DyDt(float3 velocity, float3 acceleration)
+{
+    // x' = v
+    // v' = acceleration
+    IntegrationEquationVariables newSystem;
+    newSystem.Position = velocity;
+    newSystem.Velocity = acceleration;
+    return newSystem;
+}
+
+/**
+ * Integrates the current system of ODEs of position and velocity, with respect to the new acceleration.
+ * @param state The current values of the position and velocity ODEs
+ * @param acceleration The current acceleration we want to apply on the existing system.
+ * @return The new position and velocity of the system.
+ */
+//  Runge Kutta (K4) discrete integration formula
+IntegrationEquationVariables Integrate(IntegrationEquationVariables state, float3 acceleration)
+{
+    IntegrationEquationVariables k1 = DyDt(state.Velocity, acceleration);
+    IntegrationEquationVariables k2 = DyDt(state.Velocity + k1.Velocity * _DeltaTime / 2.0f, acceleration);
+    IntegrationEquationVariables k3 = DyDt(state.Velocity + k2.Velocity * _DeltaTime / 2.0f, acceleration);
+    IntegrationEquationVariables k4 = DyDt(state.Velocity + k3.Velocity * _DeltaTime, acceleration);
+
+    state.Position += (k1.Position + (k2.Position + k3.Position) * 2.0f + k4.Position) * _DeltaTime / 6.0f;
+    state.Velocity += (k1.Velocity + (k2.Velocity + k3.Velocity) * 2.0f + k4.Velocity) * _DeltaTime / 6.0f;
+    return state;
+}
+
+/**
+ * Applies the collision response on the given object.
+ * @param physicsVariables The position and velocity variables corresponding to the object.
+ * @param otherInverseMass The inverse mass of the object this spring node collided with.
+ * @param otherVelocity The velocity of the object this spring node collided with.
+ * @param minimumTranslationToResolve The minimum translation to the position required to move out of intersection.
+ * @param direction The direction of the velocity vector response.
+ */
+IntegrationEquationVariables ApplyCollisionResponse(IntegrationEquationVariables physicsVariables, float otherInverseMass, float3 otherVelocity, float3 minimumTranslationToResolve, float3 direction)
+{
+    float sumOfInverseMasses = _InverseMass + otherInverseMass;
+    //relative velocity is velocuty difference ebtween two bodies
+    float3 relativeVelocity = physicsVariables.Velocity - otherVelocity;
+    float vDotDir = dot(relativeVelocity, direction);
+
+    // Only apply if at least one of the objects is moving towards the other.
+    if (vDotDir <= 0.0f)
+    {
+        // Calculate the translation and velocity impulse impact.
+        //impulse means instant force applied in a given timestep or during collision
+        //force moves gradually while impulse moes instantaniously
+        //impulse length means how strong the bounce correction must be to correct the collision detection
+        //Restitution = bounciness
+        float impulseLength = -(1.0f + _RestitutionConstant) * (vDotDir / sumOfInverseMasses);
+        float3 impulse = direction * impulseLength;
+        minimumTranslationToResolve /= sumOfInverseMasses;
+
+        // Friction
+        //friction is the force which reduces the tangential motion or remaining velocity of an object when its no longer getting externel force 
+        float3 relativeVelocityProjected = vDotDir * direction;
+        float3 tangentialVelocity = relativeVelocity - relativeVelocityProjected;
+        float3 friction = tangentialVelocity * (_FrictionConstant / sumOfInverseMasses);
+        impulse -= friction;
+
+        physicsVariables.Position += minimumTranslationToResolve * _InverseMass;
+        physicsVariables.Velocity += impulse * _InverseMass;
+    }
+    return physicsVariables;
+}
+
+/**
+ * Response to cuboid collision when there is a collision.
+ * @param physicsVariables The position and velocity of the object we want to check collision for and to apply the response to.
+ * @param radius The radius of the object we want to check collision for and to apply the response to.
+ * @param cuboidMinimum The point of the cuboid with the smallest components.
+ * @param cuboidMaximum The point of the cuboid with the largest components.
+ */
+IntegrationEquationVariables RespondToPossibleCuboidCollision(IntegrationEquationVariables physicsVariables, float radius, float3 center, float3 halfSize,float4x4 orientation)
+{
+    // float3 closest = clamp(physicsVariables.Position, cuboidMinimum, cuboidMaximum);
+    // float3 delta = physicsVariables.Position - closest;
+    // float deltaSqrMagnitude = dot(delta, delta); //cheaper alternative to length()
+
+    float3 rel = physicsVariables.Position - center;
+    float3x3 R = float3x3(orientation[0].xyz,
+                        orientation[1].xyz,
+                        orientation[2].xyz);
+    float3x3 Rinv = transpose(R);
+    float3 local = mul(Rinv,rel);     
+
+    float3 closest = clamp(local,-halfSize,halfSize);
+    float3 delta = local - closest;
+    float deltaSqrMagnitude = dot(delta,delta);
+
+    if(deltaSqrMagnitude > radius * radius)
+        return physicsVariables;//havnt collided yet
+
+    float deltaMagnitude = sqrt(deltaSqrMagnitude);
+    float3 direction = delta / deltaMagnitude; //normalized direction( a - b / length(a^2 - b^2)) / length = sqrt(dot(a - b),dot(a-b))
+    float3 minimumTranslationToResolve = direction * (radius - deltaMagnitude);
+
+    float3 dirWorld =
+        direction.x * orientation[0] +
+        direction.y * orientation[1] +
+        direction.z * orientation[2];
+
+    float3 mtvWorld =
+        minimumTranslationToResolve.x * orientation[0] +
+        minimumTranslationToResolve.y * orientation[1] +
+        minimumTranslationToResolve.z * orientation[2];
+
+    // return ApplyCollisionResponse(physicsVariables, 0, float3(0, 0, 0), minimumTranslationToResolve, direction);
+    return ApplyCollisionResponse(physicsVariables, 0, float3(0, 0, 0),mtvWorld,dirWorld);
+}
+
+/**
+ * Response to sphere collision when there is a collision.
+ * @param physicsVariables The position and velocity of the object we want to check collision for and to apply the response to.
+ * @param radius The radius of the object we want to check collision for and to apply the response to.
+ * @param otherPosition The centroid position of the sphere we want to check collision for.
+ * @param otherVelocity The velocity of the sphere we want to check collision for.
+ * @param otherRadius The radius of the sphere we want to check collision for.
+ */
+IntegrationEquationVariables RespondToPossibleSphereCollision(IntegrationEquationVariables physicsVariables, float radius, float3 otherPosition, float3 otherVelocity, float otherRadius)
+{
+    float3 directionWithLength = physicsVariables.Position - otherPosition;
+    float lengthSqr = dot(directionWithLength, directionWithLength);
+    float totalRadius = radius + otherRadius;
+    if(lengthSqr < totalRadius * totalRadius)
+    {
+        float length = sqrt(lengthSqr);
+        float3 direction = directionWithLength / length;
+        float3 minimumTranslationToResolve = direction * (totalRadius - length);
+        return ApplyCollisionResponse(physicsVariables, _InverseMass, otherVelocity, minimumTranslationToResolve, direction);
+    }
+    return physicsVariables;
+}
+float hash(float3 p)
+{
+    float3 k = float3(0.3183099, 0.3678794, 0.204123);
+    float n = dot(p, float3(127.1, 311.7, 74.7));
+    float3 s = sin(float3(n, n+1.0, n+2.0)) * 43758.5453;
+    return frac(s);
+}
+
+float Noise3D(float3 p) //3d value noise
+{
+    float3 fp = floor(p);
+    float3 f = frac(p);
+
+    float3 c000 = hash(fp + float3(0,0,0));
+    float3 c100 = hash(fp + float3(1,0,0));
+    float3 c010 = hash(fp + float3(0,1,0));
+    float3 c110 = hash(fp + float3(1,1,0));
+    float3 c001 = hash(fp + float3(0,0,1));
+    float3 c101 = hash(fp + float3(1,0,1));
+    float3 c011 = hash(fp + float3(0,1,1));
+    float3 c111 = hash(fp + float3(1,1,1));
+
+    float3 wx = f;
+    wx = wx * wx * (3 - 2 * wx);   // smoothstep curve for interpolation
+
+    float3 c00 = lerp(c000, c100, wx.x);
+    float3 c10 = lerp(c010, c110, wx.x);
+    float3 c01 = lerp(c001, c101, wx.x);
+    float3 c11 = lerp(c011, c111, wx.x);
+
+    float3 c0 = lerp(c00, c10, wx.y);
+    float3 c1 = lerp(c01, c11, wx.y);
+
+    return lerp(c0, c1, wx.z);
+}   
+float3 dNoise(float3 p) // derivative (finite difference)
+{
+    float eps = _WindSpatialScale; //0.01 / 
+    float nx1 = Noise3D(p + float3(eps,0,0));
+    float nx2 = Noise3D(p - float3(eps,0,0));
+
+    float ny1 = Noise3D(p + float3(0,eps,0));
+    float ny2 = Noise3D(p - float3(0,eps,0));
+
+    float nz1 = Noise3D(p + float3(0,0,eps));
+    float nz2 = Noise3D(p - float3(0,0,eps));
+
+    float3 d;
+    d.x = (nx1 - nx2) / (2 * eps);
+    d.y = (ny1 - ny2) / (2 * eps);
+    d.z = (nz1 - nz2) / (2 * eps);
+
+    return d;
+} 
+float3 CurlNoise(float3 p)
+{
+    // produce three scalar noise fields with small offsets/seeds
+    float3 p1 = p + float3(0.0, 0.0, 0.0);
+    float3 p2 = p + float3(19.1, 17.7, 29.3);
+    float3 p3 = p + float3(83.2, 45.1, 12.5);
+
+    float3 g1 = dNoise(p1); // gradient of noise1
+    float3 g2 = dNoise(p2); // gradient of noise2
+    float3 g3 = dNoise(p3); // gradient of noise3
+
+    // combine into divergence-free vector (standard curl construction)
+    float3 curl;
+    curl.x = g3.y - g2.z;
+    curl.y = g1.z - g3.x;
+    curl.z = g2.x - g1.y;
+
+    return curl;
+}
+
+float3 SampleWindField(float3 pos, float time)
+{
+    float3 p = pos * 5.0f + time * 2.0f;
+    float3 curl = CurlNoise(p);
+    return normalize(curl) * _WindStrength;
+}
+/**
+ * The kernel which calculates the spring forces and applies them.
+ * @param id The id of this particle as a 1D index.
+ */
+[numthreads(32, 1, 1)]
+void CalculateAndApplySpringForce(uint3 id : SV_DispatchThreadID)
+{
+    if(id.x >= _SpringNodeCount)
+        return;
+
+    SpringNodeInput springNode = _SpringNodesBuffer[id.x];
+    if (springNode.isPinned == 1)
+    {
+        // float3 offset = springNode.PinnedPos - springNode.PhysicsVariables.Position;
+        // springNode.PhysicsVariables.Velocity -= offset / _DeltaTime; 
+        // springNode.PhysicsVariables.Position += offset;
+
+        springNode.PhysicsVariables.Velocity = 0.0f;
+        springNode.PhysicsVariables.Position = springNode.PinnedPos;
+
+        SpringNodeOutput outData;
+        outData.PhysicsVariables = springNode.PhysicsVariables;
+        _SpringNodesOutputBuffer[id.x] = outData;
+        return;
+    }
+
+    float3 totalForce = float3(0, 0, 0);
+    for(uint i = springNode._SpringDamperBuffer.Start; i < springNode._SpringDamperBuffer.End; ++i)
+    {
+        // Cache the spring stuff.
+        SpringDamper springDamper = _SpringDamperBuffer[i];
+        SpringNodeInput otherSpringNode = _SpringNodesBuffer[springDamper.OtherNodeId];
+
+        float3 directionWithLength = otherSpringNode.PhysicsVariables.Position - springNode.PhysicsVariables.Position;
+        float currentDistance = length(directionWithLength);
+        float deltaDistance = currentDistance - springDamper.DesiredDistance;
+        float3 directionNormalized = directionWithLength / currentDistance;
+        float3 relativeVelocity = otherSpringNode.PhysicsVariables.Velocity - springNode.PhysicsVariables.Velocity;
+        // Projects the relative velocity to the direction of the spring connection.
+        float3 dampingDirection = dot(relativeVelocity, directionNormalized) * directionNormalized; //scalar proj = (a.b)/|b|
+        totalForce += springDamper.SpringConstant * deltaDistance * directionNormalized + _SpringDamping * dampingDirection;
+        //Hookes law (Calculates Force) => k * deltaDist * dir
+        //Damping Force(Resistance force) => Hookes Law + (springDamping * dampingDirection)
+    }
+
+    float3 windVel = SampleWindField(springNode.PhysicsVariables.Position, _Time);
+    float3 relVel = springNode.PhysicsVariables.Velocity - windVel;
+    // aerodynamic drag (simple quadratic drag)
+    float speed = length(relVel);
+    if (speed > 1e-6)
+    {
+        float3 dir = relVel / speed;
+        float dragMag = 0.5f * speed * speed; //_DragCoefficient uniform
+        float3 dragForce = -dir * dragMag;
+        totalForce += dragForce;
+    }
+
+    // Now, integrate the force.
+    //a = F * (1 / m) + G
+    float3 acceleration = totalForce * _InverseMass + _Gravity;
+
+    //we do integrattion to convert accelaration forec to actual readable positions to apply to the buffer 
+    springNode.PhysicsVariables = Integrate(springNode.PhysicsVariables, acceleration);
+    _SpringNodesOutputBuffer[id.x].PhysicsVariables = springNode.PhysicsVariables;
+}
+
+[numthreads(32, 1, 1)]
+void ResolveCollisions(uint3 id : SV_DispatchThreadID)
+{
+    if(id.x >= _SpringNodeCount)
+        return;
+
+    SpringNodeInput springNode = _SpringNodesBuffer[id.x];
+    if (springNode.isPinned == 1)
+    {
+        // float3 offset = springNode.PinnedPos - springNode.PhysicsVariables.Position;
+        // springNode.PhysicsVariables.Velocity -= offset / _DeltaTime; 
+        // springNode.PhysicsVariables.Position += offset;
+
+        springNode.PhysicsVariables.Velocity = 0.0f;
+        springNode.PhysicsVariables.Position = springNode.PinnedPos;
+        
+        SpringNodeOutput outData;
+        outData.PhysicsVariables = springNode.PhysicsVariables;
+        _SpringNodesOutputBuffer[id.x] = outData;
+        return;
+    }
+    uint i;
+
+    for(i = 0; i < _SpringNodeCount; ++i)
+    {
+        if(i != id.x)
+        {
+            SpringNodeInput otherSpringNode = _SpringNodesBuffer[i];
+            springNode.PhysicsVariables = RespondToPossibleSphereCollision(springNode.PhysicsVariables, springNode.Radius, otherSpringNode.PhysicsVariables.Position, otherSpringNode.PhysicsVariables.Velocity, otherSpringNode.Radius);
+        }
+    }
+
+    for(i = 0; i < _BoxCollidersCount; ++i)
+    {
+        springNode.PhysicsVariables = RespondToPossibleCuboidCollision(springNode.PhysicsVariables, springNode.Radius, _BoxCollidersBuffer[i].Center,_BoxCollidersBuffer[i].HalfSize, _BoxCollidersBuffer[i].Orientation);
+    }
+    
+    for(i = 0; i < _SphereColliderCount; ++i)
+    {
+        springNode.PhysicsVariables = RespondToPossibleSphereCollision(springNode.PhysicsVariables, springNode.Radius, _SpheresColliderBuffer[i].Position, float3(0, 0, 0), _SpheresColliderBuffer[i].Radius);
+    }
+
+    _SpringNodesOutputBuffer[id.x].PhysicsVariables = springNode.PhysicsVariables;
+}

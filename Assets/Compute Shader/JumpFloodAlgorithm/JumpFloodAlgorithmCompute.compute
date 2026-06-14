@@ -1,0 +1,193 @@
+#pragma kernel InitSeeds
+#pragma kernel StepJFA
+#pragma kernel ComputeSDF
+
+#define _SEED_CHANCE 0.0005f
+Texture2D<float4> _InputTex;SamplerState sampler_InputTex;     
+RWTexture2D<float4> _FrontBuffer;
+RWTexture2D<float4> _BackBuffer; 
+RWTexture2D<float4> _Result; 
+float _StepWidth,_AlphaCutOff;
+float4 _Color;
+float2 _FallOff;
+uint2 _TexSize;
+uint _MaxSteps; //optimal max steps should be log10(tex.width * tex.height);
+
+inline float4 EncodeData(in float2 uv,in float3 col)
+{
+    float4 pack = 0;
+    pack.xy = uv;
+    float R_packed = floor(col.x * 255.0f);
+    float G_packed = floor(col.y * 255.0f);
+    float B_packed = floor(col.z * 255.0f);
+    pack.z = (R_packed * 255.0f) + G_packed; //rPacked * 255 -> shift he R channel by one byte
+    pack.w = B_packed;
+    return pack;
+}
+inline void DecodeData(in float4 data,out float2 uv,out float3 col)
+{
+    uv = data.xy;
+    col.x = floor(data.z / 256.0f) / 255.0f; //because we have to it into two channels we are doing floor
+    col.y = fmod(data.z,256.0) / 255.0f; 
+    col.z = fmod(data.w,256.0) / 255.0f; // data.w / 255;
+}
+/* Euclidean distance */
+/* https://en.wikipedia.org/wiki/Euclidean_distance */ 
+float euclideanDistance(float p1, float p2) {
+	float d1 = (p1 - p2);
+	return sqrt(pow(d1, 2.0));
+}
+
+float euclideanDistance(float2 p1, float2 p2) {
+	float d1 = (p1.x - p2.x);
+	float d2 = (p1.y - p2.y);
+	return sqrt(pow(d1, 2.0) + pow(d2, 2.0));
+}
+
+float euclideanDistance(float3 p1, float3 p2) {
+	float d1 = (p1.x - p2.x);
+	float d2 = (p1.y - p2.y);
+	float d3 = (p1.z - p2.z);
+	return sqrt(pow(d1, 2.0) + pow(d2, 2.0) + pow(d3, 2.0));
+}
+
+/* Manhattan distance */
+/* https://en.wikipedia.org/wiki/Taxicab_geometry */ 
+float manhattanDistance(float p1, float p2) {
+	float d1 = abs(p1 - p2);
+	return d1;
+}
+
+float manhattanDistance(float2 p1, float2 p2) {
+	float d1 = abs(p1.x - p2.x);
+	float d2 = abs(p1.y - p2.y);
+	return d1 + d2;
+}
+
+float manhattanDistance(float3 p1, float3 p2) {
+	float d1 = abs(p1.x - p2.x);
+	float d2 = abs(p1.y - p2.y);
+	float d3 = abs(p1.z - p2.z);
+	return d1 + d2 + d3;
+}
+
+/* Minkowski distance */
+/* https://en.wikipedia.org/wiki/Minkowski_distance */ 
+float minkowskiDistance(float p1, float p2, float power) {
+	float d1 = pow(abs(p1 - p2), power);
+	return pow(d1, 1.0 / power);
+}
+
+float minkowskiDistance(float2 p1, float2 p2, float power) {
+	float d1 = pow(abs(p1.x - p2.x), power);
+	float d2 = pow(abs(p1.y - p2.y), power);
+	return pow(d1 + d2, 1.0 / power);
+}
+
+float minkowskiDistance(float3 p1, float3 p2, float power) {
+	float d1 = pow(abs(p1.x - p2.x), power);
+	float d2 = pow(abs(p1.y - p2.y), power);
+	float d3 = pow(abs(p1.z - p2.z), power);
+	return pow(d1 + d2 + d3, 1.0 / power);
+}
+
+/* Chebyshev distance */
+/* https://en.wikipedia.org/wiki/Chebyshev_distance */ 
+float chebyshevDistance(float p1, float p2) {
+	float d1 = abs(p1 - p2);
+	return d1;
+}
+
+float chebyshevDistance(float2 p1, float2 p2) {
+	float d1 = abs(p1.x - p2.x);
+	float d2 = abs(p1.y - p2.y);
+	return max(d1, d2);
+}
+
+float chebyshevDistance(float3 p1, float3 p2) {
+	float d1 = abs(p1.x - p2.x);
+	float d2 = abs(p1.y - p2.y);
+	float d3 = abs(p1.z - p2.z);
+	return max(d1, max(d2, d3));
+}
+
+float4 StepJFA(int2 coord, float stepWidth)
+{
+    float2 curUV = (coord + 0.5) / _TexSize;
+
+    float bestDist = 1e9;
+    float2 bestUV = float2(0,0);
+    float3 bestCol = float3(0,0,0);
+
+    //sample 9 directions => grid of neightbouring pixels 
+    for (int y = -1; y <= 1; ++y)
+    {
+        for (int x = -1; x <= 1; ++x)
+        {
+            int2 sampleCoord = coord + int2(x, y) * (int)stepWidth;
+            if (sampleCoord.x < 0 || sampleCoord.y < 0 || sampleCoord.x >= _TexSize.x || sampleCoord.y >= _TexSize.y)
+                continue;
+
+            float4 data = _FrontBuffer[sampleCoord];
+            float2 seedUV;
+            float3 seedCol;
+            DecodeData(data, seedUV, seedCol);
+
+            if (seedUV.x == 0 && seedUV.y == 0) continue;
+
+            float dist = length(seedUV - curUV);
+            // float dist = euclideanDistance(seedUV,curUV);
+            if (dist < bestDist)
+            {
+                bestDist = dist;
+                bestUV = seedUV;
+                bestCol = seedCol;
+            }
+        }
+    }
+
+    return EncodeData(bestUV, bestCol);
+}
+
+[numthreads(8,8,1)]
+void InitSeeds (uint3 id : SV_DispatchThreadID)
+{
+    if(id.x >= _TexSize.x || id.y >= _TexSize.y) return;
+
+    float4 c = _InputTex.Load(int3(id.xy,0));
+    float2 uv = (id.xy + 0.5) / _TexSize;
+    if(c.a > _AlphaCutOff)
+    {
+        _FrontBuffer[id.xy] = EncodeData(uv,c.xyz);
+    }
+    else
+    {
+        _FrontBuffer[id.xy] = 0;
+    }
+    _BackBuffer[id.xy] = 0;
+}
+[numthreads(8,8,1)]
+void StepJFA (uint3 id : SV_DispatchThreadID)
+{
+    if(id.x >= _TexSize.x || id.y >= _TexSize.y) return;
+
+    _BackBuffer[id.xy] = StepJFA(id.xy,_StepWidth);
+}
+[numthreads(8,8,1)]
+void ComputeSDF (uint3 id : SV_DispatchThreadID)
+{
+    if(id.x >= _TexSize.x || id.y >= _TexSize.y) return;
+
+    float2 uv = (id.xy + 0.5) / _TexSize;
+
+    float4 data = _FrontBuffer[id.xy];
+    float2 seedUV;
+    float3 seedColor;
+    DecodeData(data, seedUV, seedColor);
+
+    // float dist = min(length(seedUV - uv) / 16.0f,1.0f);
+    // float dist = saturate(euclideanDistance(seedUV,uv));    
+    float dist = saturate(length(seedUV - uv));    
+    _Result[id.xy] = smoothstep(_FallOff.x,_FallOff.y,dist) * _Color;
+}
+

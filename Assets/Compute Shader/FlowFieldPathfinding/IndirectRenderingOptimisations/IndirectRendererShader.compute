@@ -1,0 +1,147 @@
+#pragma kernel CSMain
+
+struct Agents
+{
+    float3 position;
+    float speed;
+    float3 direction;
+    float noiseOffset;
+    float3 idleOrigin;
+    // float alive;
+    float frame;
+    float3 idleDir;
+    float idleReturnDist;
+    float prevState;
+    float slidingTime;
+    float gravity;
+    float texRandom;
+};
+StructuredBuffer<Agents> _AgentsBuffer;
+AppendStructuredBuffer<uint> _AppendLOD0;
+AppendStructuredBuffer<uint> _AppendLOD1;
+AppendStructuredBuffer<uint> _AppendLOD2;
+
+cbuffer UnityperMaterial : register(b0)
+{
+    float3 _CameraPos;
+    uint _AgentCount;
+    float _LodDist01,_LodDist02;
+    float4 _ViewFrustumPlanes[6];
+    float _MaxVertexDistance;
+    float4x4 _VPMatrix;
+    float _DepthBias;
+    int _HiZTextureSize; 
+    int _HiZMipCount;     
+};
+Texture2D<float> _HiZDepthTexture;SamplerState sampler_HiZDepthTexture;
+
+float planeDistance(float4 plane,float3 p){
+    return dot(plane.xyz,p) + plane.w;
+}
+
+bool isInFrontOfPlane(float4 plane,float3 p){
+    return planeDistance(plane,p) > 0;
+}
+
+// convert clip.z/clip.w -> depth 0..1 (NDC -> 0..1)
+float ClipZTo01(float clipZ, float clipW)
+{
+    float ndcZ = clipZ / clipW;           
+    // Map NDC [-1,1] to 0..1
+    return ndcZ * 0.5f + 0.5f;
+}
+// compute approximate screen-space radius (in pixels) for object's bounding sphere radius
+float ScreenRadiusPixels(float3 pos, float radius, float4x4 vp, float2 hizSize)
+{
+    float4 c = mul(vp, float4(pos,1));
+    float4 cr = mul(vp, float4(pos + float3(radius,0,0),1)); // sample offset along X
+    if (c.w <= 1e-6) return 0;
+    float2 ndc = c.xy / c.w;
+    float2 ndcr = cr.xy / cr.w;
+    float ndcDelta = abs(ndcr.x - ndc.x);
+    // convert ndc delta to pixels (use width)
+    return ndcDelta * 0.5 * hizSize.x; // approximate, ok for mip selection
+}
+
+// Conservative HiZ occlusion test with mip fallback
+bool isOccluded_HiZ(float3 pos, float radius, float4x4 vp, float2 hizSize, int hizMipCount, float bias)
+{
+    float4 clip = mul(vp, float4(pos,1));
+    if (clip.w <= 1e-6) return false; // behind camera => treat as visible
+    float2 uv = (clip.xy / clip.w) * 0.5f + 0.5f;
+    if (uv.x < 0 || uv.x > 1 || uv.y < 0 || uv.y > 1) return false;
+
+    float depth01 = ClipZTo01(clip.z, clip.w);
+
+    // pick mip based on projected radius (coarse-first)
+    float pixelRadius = ScreenRadiusPixels(pos, radius, vp, hizSize);
+    float mipf = max(0, log2(max(pixelRadius, 1.0)));
+    int mip = clamp((int)floor(mipf), 0, hizMipCount - 1);
+
+    // conservative test at chosen mip then refine 1-2 mips if needed
+    float sceneDepth = _HiZDepthTexture.SampleLevel(sampler_HiZDepthTexture, uv, mip);
+    if (depth01 > sceneDepth - bias) return true;
+
+    // optional refine: check one finer mip for false negatives
+    if (mip > 0)
+    {
+        float sceneDepthFine = _HiZDepthTexture.SampleLevel(sampler_HiZDepthTexture, uv, mip-1);
+        if (depth01 > sceneDepthFine - bias) return true;
+    }
+
+    return false;
+}
+
+// bool isOccluded(float3 pos)
+// {
+//     float4 clip = mul(_VPMatrix, float4(pos, 1.0));
+//     if (clip.w <= 0.0001f) return false;
+
+//     float2 uv = (clip.xy / clip.w) * 0.5f + 0.5f;
+//     if (uv.x < 0 || uv.x > 1 || uv.y < 0 || uv.y > 1) return false;
+
+//     float sceneDepth = _HiZDepthTexture.SampleLevel(sampler_HiZDepthTexture, uv, 0).x;
+//     float sampleDepth01 = ClipZTo01(clip.z, clip.w);
+//     return sampleDepth01 > (sceneDepth - _DepthBias);
+// }
+
+[numthreads(512,1,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_AgentCount) return;
+
+    float3 p = _AgentsBuffer[id.x].position;
+    float3 d = p - _CameraPos;
+
+    if (dot(d, d) > _MaxVertexDistance * _MaxVertexDistance) return;
+    float sqrDist = dot(d, d);
+    
+    //     float4 clip = mul(_VPMatrix, float4(p,1));
+    //     if (abs(clip.w) < 1e-6) return;            // avoid divide by zero
+    // float3 ndc = clip.xyz / clip.w;            // -1..1
+    // // behind camera if ndc.z < -1 or ndc.z > 1 depending on projection, but clip.w sign issues handled by abs above
+    // if (ndc.x < -1 || ndc.x > 1 || ndc.y < -1 || ndc.y > 1 || ndc.z < -1 || ndc.z > 1) return;
+    
+    bool isVisible = true;
+    if (!isInFrontOfPlane(_ViewFrustumPlanes[5], p))
+        isVisible = false; //early break check    
+
+    [unroll]
+    for (int i = 0; i < 5; i++)
+    {
+        if (!isInFrontOfPlane(_ViewFrustumPlanes[i], p))
+        {
+            isVisible = false;
+            break;
+        }        
+    }
+    // if(!isOccluded(p)) 
+    //     isVisible = false;
+    if(!isOccluded_HiZ(p,0.25f,_VPMatrix,float2(_HiZTextureSize, _HiZTextureSize),_HiZMipCount,_DepthBias))
+        isVisible = false;
+
+    if(!isVisible)return;  
+    if (sqrDist < _LodDist01) _AppendLOD0.Append(id.x);
+    else if (sqrDist < _LodDist02) _AppendLOD1.Append(id.x);
+    else _AppendLOD2.Append(id.x);
+}

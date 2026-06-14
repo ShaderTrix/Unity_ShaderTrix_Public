@@ -1,0 +1,24 @@
+#pragma kernel CSMain
+
+struct SourceVertex
+{
+    float3 position;
+    float3 normal;
+};
+StructuredBuffer<SourceVertex> _SourceVertex;
+
+RWTexture2D<float4> _outputPositions;
+RWTexture2D<float4> _outputNormals;
+
+int _vertexCount;
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    if((int)id.x >= _vertexCount) return;
+
+    int index = id.y * _vertexCount + id.x;
+    SourceVertex info = _SourceVertex[index];
+    _outputPositions[id.xy] = float4(info.position,1.0f);
+    _outputNormals[id.xy] = float4(info.normal,1.0f);
+}

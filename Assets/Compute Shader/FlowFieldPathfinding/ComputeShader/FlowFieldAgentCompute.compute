@@ -1,0 +1,534 @@
+#pragma kernel CSMain
+#include "BVH_Intersections.hlsl"
+
+struct Agents
+{
+    float3 position;
+    float speed;
+
+    float3 direction;
+    float noiseOffset;
+
+    float3 idleOrigin;   // where idle movement started
+    // float alive;
+    float frame;
+
+    float3 idleDir; 
+    float idleReturnDist;
+
+    float prevState;    
+    float slidingTime;       
+    float gravity;
+    float texRandom;
+};
+RWStructuredBuffer<Agents> _AgentsBuffer;
+
+struct FlowCell
+{
+    float2 bestDir;//xz
+};
+StructuredBuffer<FlowCell> _FlowCells;
+
+struct CustomEffects
+{
+    float3 repelPositions;
+    float repelRadius;  
+    float3 spiralPositions;
+    float spiralRadius;      
+}; 
+StructuredBuffer<CustomEffects> _CustomEffectsBuffer;
+
+#define NO_OF_ANIMATIONS 2 
+cbuffer UnityPerMaterial : register(b0)
+{
+    int _AgentsCount,_NumOfFrames;
+    float _AgentSpeedVariation,_AgentSpeed,_DeltaTime,_Time,_CellSize,_CellRadius,_GlobalSpeedMul,_NeighbourDistance;
+    float3 _Destination,_GridOrigin;
+    int2 _GridSize;
+    int _RepelCount,_SpiralCount;
+}
+
+// Helper: world -> cell index (clamped)
+int2 WorldToCell(float3 worldPos) {
+    float2 local = (worldPos.xz - _GridOrigin.xz) / _CellSize;
+    int cx = clamp((int)floor(local.x), 0, _GridSize.x - 1);
+    int cy = clamp((int)floor(local.y), 0, _GridSize.y - 1);
+    return int2(cx, cy);
+}
+uint CellToIndex(int2 c) {
+    return (uint)(c.y * _GridSize.x + c.x);
+}
+
+float hash(float n) { return frac(sin(n) * 43758.5453); }
+// The noise function returns a value in the range -1.0f -> 1.0f 
+float noise1( float3 x )
+{
+	float3 p = floor(x);
+	float3 f = frac(x);
+
+	f = f*f*(3.0-2.0*f);
+	float n = p.x + p.y*57.0 + 113.0*p.z;
+
+	return lerp(lerp(lerp( hash(n+0.0), hash(n+1.0),f.x),
+					lerp( hash(n+57.0), hash(n+58.0),f.x),f.y),
+				lerp(lerp( hash(n+113.0), hash(n+114.0),f.x),
+					lerp( hash(n+170.0), hash(n+171.0),f.x),f.y),f.z);
+}
+
+#define _AGENTSTATE_IDLE    0
+#define _AGENTSTATE_SEEKING 1
+#define _AGENTSTATE_REACHED 2
+#define _MIN_SEEKING_DISTANCE 10.0f
+int GetAgentState(float3 currPos, out float3 moveDirection)
+{
+    int2 cell = WorldToCell(currPos);
+    float2 best = _FlowCells[CellToIndex(cell)].bestDir; // xz
+    float3 moveDir = normalize(float3(best.x, 0.0, best.y));
+
+    // fallback if best is zero (invalid cell)
+    if (all(best == 0.0)) moveDir = float3(0,0,0);
+
+    moveDirection = moveDir;
+
+    float d = distance(currPos, _Destination);
+    if (d <= _CellRadius)
+        return _AGENTSTATE_REACHED;
+    else if (d <= _MIN_SEEKING_DISTANCE)
+        return _AGENTSTATE_SEEKING;
+    else
+        return _AGENTSTATE_IDLE;
+}
+
+float3 ComputeSeparation(uint selfId, float3 selfPos)
+{
+    float3 separation = 0;
+    uint neighborCount = 0;
+
+    for (uint i = 0; i < (uint)_AgentsCount; i++) 
+    {
+        if (i == selfId) continue;
+        float3 otherPos = _AgentsBuffer[i].position;
+
+        float3 diff = selfPos - otherPos;
+        float dist = length(diff);
+        if (dist < _NeighbourDistance && dist > 1e-4f) 
+        {
+            float strength = 1.0 - saturate(dist / _NeighbourDistance); 
+            separation += diff * (strength / (dist + 0.001));
+            neighborCount++;
+        }
+    }
+
+    if (neighborCount > 0) {
+        separation /= neighborCount;
+    }
+    return separation;
+}
+
+#define _REPEL_STRENGTH   1.5  // lower = softer push
+#define _ORBIT_STRENGTH   0.1   // lower = slower orbit
+#define _EDGE_STICKINESS  0.02  // how hard they stay on the circle edge
+float3 ComputeRepulsion(float3 selfPos)
+{
+    float3 totalForce = 0;
+    [loop]
+    for (uint i = 0; i < _RepelCount; i++)
+    {
+        float3 repelPos = _CustomEffectsBuffer[i].repelPositions;
+        float radius   = _CustomEffectsBuffer[i].repelRadius;
+
+        float3 offset = selfPos - repelPos;
+        float dist = length(offset);
+
+        if (dist < radius * 1.2f)
+        {
+            // float strength = 1.0 - saturate(dist / radius); // linear circle repulsion        
+            // float strength = pow(1.0 - saturate(dist / radius), 2.0);// Sharper near the center, weaker near the edge
+            // float t = saturate(dist / radius);
+            // float strength = pow(1.0 - t, 2.0);
+            // float wiggle = 0.7 + 0.3 * sin(_Time * 2.0 + hash(selfPos.x + selfPos.z) * 6.283);
+            // strength *= wiggle;
+            // repelForce += normalize(offset) * strength;
+            float3 radial   = normalize(offset);
+            float3 tangent  = normalize(float3(-radial.z, 0, radial.x));
+
+            float t = saturate(dist / radius);
+            float strength = pow(1.0 - t, 2.0);
+
+            // Random per-agent choice: repel or orbit
+            bool orbitMode = (hash(selfPos.x + selfPos.z) > 0.5);
+
+            if (orbitMode)
+            {
+                totalForce += tangent * strength * _ORBIT_STRENGTH;
+
+                // gently push them back toward edge
+                float edgeBias = (dist - radius) * _EDGE_STICKINESS;
+                totalForce += radial * edgeBias;
+            }
+            else
+            {
+                totalForce += radial * strength * _REPEL_STRENGTH;
+            }
+        }
+    }
+    return totalForce;
+}
+
+#define _SPIRAL_STRENGTH 10.0
+#define _SPIRAL_UPWARD  2.5
+#define _SPIRAL_SPEED 4
+float3 ComputeSpiral(float3 selfPos,inout float3 selfDir,inout float selfVelocity,out bool inSpiral)
+{    
+    float3 totalForce = 0;
+    inSpiral = false;
+    [loop]
+    for (uint i = 0; i < _SpiralCount; i++)
+    {
+        uint idx = (uint)_RepelCount + i;
+
+        float3 spiralPos = _CustomEffectsBuffer[idx].spiralPositions;
+        float radius = _CustomEffectsBuffer[idx].spiralRadius;
+
+        float3 offset = selfPos - spiralPos;
+        float dist = length(offset);
+
+        if (dist < radius * 1.2f)
+        {
+            inSpiral = true;
+
+            float3 radial = normalize(offset);
+            float3 tangent  = normalize(float3(-radial.z,0, radial.x));
+
+            float t = saturate(dist / radius);
+            float strength = pow(1 - t, 2.0);
+
+            totalForce += tangent * strength * _SPIRAL_STRENGTH;
+            totalForce.y += strength * _SPIRAL_UPWARD;
+            
+            float shrinkAtTop = 1.0 / (1.0 + selfPos.y * _SPIRAL_STRENGTH * _SPIRAL_STRENGTH);
+            totalForce.xz *= shrinkAtTop;
+            selfDir = tangent;
+            selfVelocity += (1.0 + _SPIRAL_SPEED * _DeltaTime);
+        }
+    }
+    return totalForce;
+}
+#define _GOAL_SPIRAL_RADIUS 2
+float3 ComputeGoalSpiral(float3 goalPos,float3 selfPos,inout float3 selfDir,inout float selfVelocity,out bool inSpiral)
+{    
+    float3 totalForce = 0;
+    inSpiral = false;
+    
+    float3 offset = selfPos - goalPos;
+    float dist = length(offset);
+
+    if (dist < _GOAL_SPIRAL_RADIUS * 1.2f)
+    {
+        inSpiral = true;
+
+        float3 radial = normalize(offset);
+        float3 tangent  = normalize(float3(-radial.z,0, radial.x));
+
+        float t = saturate(dist / _GOAL_SPIRAL_RADIUS);
+        float strength = pow(1 - t, 2.0);
+
+        totalForce += tangent * strength * _SPIRAL_STRENGTH;
+        // totalForce.y += strength * _SPIRAL_UPWARD;
+        
+        float shrinkAtTop = 1.0 / (1.0 + selfPos.y * _SPIRAL_STRENGTH * _SPIRAL_STRENGTH);
+        totalForce.xz *= shrinkAtTop;
+        selfDir = tangent;
+        selfVelocity += (1.0 + _SPIRAL_SPEED * _DeltaTime);
+    }
+    
+    return totalForce;
+}
+#define _SKIN 0.06f // stop a hair before contact
+#define _MAX_IT 5   // handle corners / tight spaces
+// Resolves agent movement against the BVH (scene geometry), including sliding along walls
+// Parameters:
+//   pos          : starting position of the agent
+//   desiredDir   : desired movement vector (already scaled by velocity * deltaTime)
+//   steering     : agent's steering direction (used if stuck when colliding)
+//   slidingTime  : accumulates how long the agent has been sliding (inout)
+// Returns:
+//   The final resolved position after handling collisions/sliding
+float3 EnvironmentCollision(
+    float3 pos,
+    float3 desiredDir,
+    float3 steering,
+    inout float slidingTime
+) {
+    float remain = length(desiredDir);
+
+    // normalize desiredDir into a unit direction (if non-zero)
+    float3 dir   = (remain > 0.0f) ? (desiredDir / remain) : 0;
+
+    // iterate movement resolution (allowing sliding, corners, etc.)
+    [loop]
+    for (int it = 0; it < _MAX_IT && remain > 0.0f; it++)
+    {
+        float t;      // hit distance along ray
+        float3 n;     // collision surface normal
+
+        // cast a ray from current pos in movement direction to check collision
+        if (TraverseBvh(pos, normalize(dir * remain), t, n))
+        {
+            // CASE 1: Already overlapping or too close to surface
+            if (t <= _SKIN)
+            {
+                // push agent out of the surface slightly
+                pos += n * (_SKIN - t);
+
+                // project current direction onto the contact plane (sliding motion)
+                float3 tangential = dir - dot(dir, n) * n;
+                float lenT = length(tangential);
+
+                if (lenT < 1e-4f) // too close to the wall normal → no tangent
+                {
+                    // fallback: use blend of tangent + steering to avoid sticking
+                    tangential /= lenT; // normalize (avoid NaN)
+                    dir = normalize(lerp(tangential, steering, 0.85f));
+
+                    // lose some speed to simulate friction
+                    remain *= 0.1f;
+                }
+                else
+                {
+                    // slide along the tangent direction
+                    dir = tangential / lenT;
+                }
+
+                // count how long agent has been sliding
+                slidingTime += _DeltaTime;
+                continue; // restart loop from new pos
+            }
+
+            // CASE 2: collision is ahead, but we can move partially
+            float allowed = max(0.0f, t - _SKIN); // move until just before collision
+            pos += dir * allowed;                // advance along dir
+            remain -= allowed;                   // subtract distance traveled
+
+            // recalc tangent direction (slide along wall)
+            float3 tangential = dir - dot(dir, n) * n;        
+            float lenT = length(tangential);
+
+            if (lenT < 1e-4f)
+                break; // no tangent → blocked completely
+
+            dir = tangential / lenT; // slide direction
+            slidingTime += _DeltaTime; 
+        }
+        else
+        {
+            // CASE 3: no collision detected → move freely
+            pos += dir * remain;
+            remain = 0.0f;       // movement consumed
+            slidingTime = 0.0f;  // reset sliding counter
+            break;
+        }
+    }
+    return pos;
+}
+
+#define _MAX_FALL_DISTANCE 5.0f
+bool GroundCollision(float3 pos, out float groundY, out float3 groundN)
+{
+    float3 origin   = pos;
+    float3 rayDir   = float3(0, -1, 0);
+    float3 rayStep  = rayDir * _MAX_FALL_DISTANCE;
+
+    float t;
+    float3 n;
+    groundY = 0;
+    if (TraverseBvh(origin, rayStep, t, n))
+    {
+        groundY = origin.y + rayDir.y * t; 
+        groundN = n;
+        return true;
+    }
+
+    groundY = pos.y;
+    groundN = float3(0,1,0);
+    return false;
+}
+
+#define _AGENT_SIZE 0.4f
+#define _PUSH_DIST 0.4f
+float3 ComputeSeperationPush(uint id,float3 pos)
+{
+    float3 push;
+    for (uint i = 0; i < (uint)_AgentsCount; i++)
+    {
+        if (i == id) continue;
+        float3 otherPos = _AgentsBuffer[i].position;
+
+        float3 diff = pos - otherPos;
+        float dist = length(diff.xz);
+
+        float minDist = _AGENT_SIZE; // tweak this!
+        if (dist < minDist && dist > 1e-4f)
+        {
+            float3 pushDir = float3(diff.x, 0, diff.z) / dist;
+            float overlap = (minDist - dist) * _PUSH_DIST;
+            push += pushDir * overlap;
+        }
+    }
+    return push;
+}
+#define _AGENT_STERRING_STRENGTH 3.0f
+#define _WSEP 2.0f   
+#define _GRAVITY -9.18f 
+[numthreads(128,1,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_AgentsCount) return;
+    Agents a = _AgentsBuffer[id.x];
+    // if (a.alive == 0) return;
+    
+    float noise = clamp(noise1(_Time / 100.0 + a.noiseOffset), -1, 1) * 2.0 - 1.0;
+    float velocity = a.speed * (1 + noise * _AgentSpeedVariation);
+    float3 moveDir;
+    int state = GetAgentState(a.position, moveDir);    
+    float3 baseDir = 0;
+    bool inSpiral;
+    switch(state)
+    {
+        case _AGENTSTATE_IDLE:
+        {
+            float maxIdleRadius = a.idleReturnDist;
+            float returnThreshold = 0.5f;     
+            float wanderSpeedMul = 0.5f;      
+
+            if (a.prevState != _AGENTSTATE_IDLE)
+            {
+                a.idleOrigin = a.position;
+                a.direction = 0.0f; // force re-pick wander dir
+            }
+
+            if (all(a.direction == 0)) {
+                // first time entering idle, initialize to idleDir
+                a.direction = normalize(float3(a.idleDir.x, 0, a.idleDir.y)); 
+            }
+
+            float3 targetDir = a.direction; // default to current
+
+            float dist = distance(a.position.xz, a.idleOrigin.xz);
+            if (dist > maxIdleRadius) {
+                float3 toOrigin = normalize(float3(a.idleOrigin.x - a.position.x, 0, a.idleOrigin.z - a.position.z));
+                targetDir = toOrigin;
+            }
+            else if (dist < returnThreshold) {
+                targetDir = normalize(float3(a.idleDir.x, 0, a.idleDir.y));
+            }
+
+            float ip = exp(-_DeltaTime * (_AGENT_STERRING_STRENGTH * _AGENT_STERRING_STRENGTH));
+            a.direction = normalize(lerp(a.direction, targetDir, 1.0 - ip)); 
+
+            baseDir = a.direction;
+            velocity *= wanderSpeedMul;
+            a.frame = 20 + fmod(a.frame + (_DeltaTime * _AgentSpeed * _AgentSpeed * 5),10);
+            break;
+        }
+
+        case _AGENTSTATE_SEEKING:
+        {
+            baseDir = moveDir;
+            a.frame = fmod(a.frame + (_DeltaTime *  _AgentSpeed * _AgentSpeed * 10),20);
+            break;
+        }
+
+        case _AGENTSTATE_REACHED:
+        {
+            float d = distance(a.position, _Destination);
+            // if (d <= _CellRadius) 
+            //     a.alive = 0; 
+
+            bool goalSpiralActive;
+            float3 goalSpiral = 0;
+
+            float3 fakeDir = a.direction;
+            float fakeVel = velocity;
+            goalSpiral = ComputeGoalSpiral(_Destination,a.position, fakeDir, fakeVel, goalSpiralActive);
+
+            if (goalSpiralActive)
+            {
+                a.position += goalSpiral;
+                a.direction = fakeDir;
+                velocity    = fakeVel;
+            }
+
+            _AgentsBuffer[id.x] = a;
+            return;
+        }
+    }
+    a.prevState = state; 
+    // float3 seperation = ComputeSeparation(id.x, a.position);
+    float3 repultion = ComputeRepulsion(a.position);  
+    float3 seperationPush = ComputeSeperationPush(id.x,a.position);  
+    float3 spiral = ComputeSpiral(a.position,a.direction,velocity,inSpiral);
+    
+    // float3 steering = normalize(baseDir + repultion + seperationPush + seperation * _WSEP);
+    float3 steering = normalize(baseDir + repultion + seperationPush);
+    steering.y = 0.1f;
+    
+    float ip = exp(-_DeltaTime * _AGENT_STERRING_STRENGTH);
+    a.direction = normalize(lerp(steering, a.direction, ip));
+    
+    float3 desiredDir = a.direction * velocity * _DeltaTime;
+
+    float3 newPos = EnvironmentCollision(a.position, desiredDir, steering, a.slidingTime);
+
+    a.position = newPos + repultion;
+    if (!inSpiral) {
+        // a.gravity += max(_GRAVITY * _DeltaTime,-100.0f);
+        // a.position.y += a.gravity * _DeltaTime;
+        
+        // // Ground collision (clamp to floor plane y=0.1)
+        // if (a.position.y < 0.1f) {
+        //     a.position.y = 0.1f;
+        //     a.gravity = 0.0f; // stop falling
+        // }
+        // else {
+        //     a.gravity = 0.0f;
+        // }
+        float groundY;
+        float3 groundN;
+        if (GroundCollision(a.position, groundY, groundN))
+        {
+            float distToGround = a.position.y - groundY;
+
+            // predicted fall step
+            float fallStep = a.gravity * _DeltaTime;
+
+            if (distToGround + fallStep <= 0) {
+                // would cross ground this frame → snap to ground
+                a.position.y = groundY;
+                a.gravity = 0.0f;
+            }
+            else {
+                // still above ground
+                a.gravity += _GRAVITY * _DeltaTime;
+                a.position.y += fallStep;
+            }
+        }
+
+    }
+    a.position += spiral;    
+    // Optional: align facing with actual motion
+    // if (length(desiredDir) > 0.0f)
+    // {
+    //     float3 moved = newPos - a.position;
+    //     if (length(moved) > 0.0001f)
+    //         a.direction = normalize(moved);
+    // }
+
+    // If agent has been sliding for > 1.5s, force idle
+    if (a.slidingTime > 1.5f) {
+        state = _AGENTSTATE_IDLE;
+        a.prevState = _AGENTSTATE_IDLE;
+        a.slidingTime = 0.0f;
+    }
+    _AgentsBuffer[id.x] = a;
+}

@@ -1,0 +1,272 @@
+#pragma kernel ClearAccum
+#pragma kernel AccumIDs
+#pragma kernel AliveBlocks
+#pragma kernel TransferBlocks
+#pragma kernel CubePhysics
+
+Texture2D<float4> _inputColorBuffer;
+Texture2D<float4> _inputPositionBuffer;
+struct CubeData
+{
+    float4 position;
+    float4 scale;  
+    float4 color;              
+    float2 uv;
+    int id;
+    float padding;
+};
+RWStructuredBuffer<CubeData> _AliveBuffer;
+RWStructuredBuffer<uint> _AliveCounter; 
+
+struct CubePhysicsData
+{
+    float4 position;
+    float4 scale;
+    float4 color;
+    float4 velocity;        
+};
+RWStructuredBuffer<CubePhysicsData> _DeadBuffer;
+RWStructuredBuffer<uint> _DeadCounter; 
+
+struct AccumalatorData
+{
+    uint posXSum;
+    uint posYSum;
+    uint posZSum;     
+    uint colorXsum;
+    uint colorYsum;
+    uint colorZsum;
+    uint count; 
+    uint minZ;
+    uint idSum;
+    float3 padding;
+};
+RWStructuredBuffer<AccumalatorData> _AccumBuffer;
+
+#define _MAX_DEAD_CUBES 200000
+groupshared uint _AliveCountSnapshot;
+
+cbuffer properties
+{
+    float2 _TexSize;
+    float _BlockSize;
+    float3 _CameraPos,_CameraForward;
+    float _VerticalFOV;
+
+    float3 _Gravity;
+    float _DeltaTime,_Damping;
+    int _KillEnemyID;
+}
+[numthreads(8,1,1)]
+void ClearAccum (uint3 id : SV_DispatchThreadID)
+{
+    uint blockCount = (uint)(_BlockSize * _BlockSize);
+    if (id.x >= blockCount) return;
+
+    _AccumBuffer[id.x] = (AccumalatorData)0;
+    _AccumBuffer[id.x].minZ = 0x7FFFFFFF; 
+}
+
+[numthreads(8,8,1)]
+void AccumIDs (uint3 id : SV_DispatchThreadID)
+{
+    if(id.x >= (uint)_TexSize.x || id.y >= (uint)_TexSize.y)return;
+    
+    float4 color = _inputColorBuffer.Load(int3(id.xy, 0));
+    float4 position = _inputPositionBuffer.Load(int3(id.xy,0));
+
+    float maxRGB = max(color.r, max(color.g, color.b));
+    if (maxRGB < 1e-12) return; 
+
+    float2 uv = (float2)id.xy / (float2)_TexSize;
+    uint blockX = (uint)floor(uv.x * _BlockSize);
+    uint blockY = (uint)floor(uv.y * _BlockSize);
+    uint blockID = blockY * (uint)_BlockSize + blockX; //row major 2d to 1d convertion
+    
+    uint encX = (uint)round((position.x + 512.0f) * 100000.0f);
+    uint encY = (uint)round((position.y + 512.0f) * 100000.0f);
+    uint encZ = (uint)round((position.z + 512.0f) * 100000.0f);
+
+    uint cR = (uint)round(saturate(color.r) * 255.0);
+    uint cG = (uint)round(saturate(color.g) * 255.0);
+    uint cB = (uint)round(saturate(color.b) * 255.0);
+
+    InterlockedAdd(_AccumBuffer[blockID].posXSum, encX);
+    InterlockedAdd(_AccumBuffer[blockID].posYSum, encY);
+    InterlockedAdd(_AccumBuffer[blockID].posZSum, encZ);
+
+    InterlockedAdd(_AccumBuffer[blockID].colorXsum, cR);
+    InterlockedAdd(_AccumBuffer[blockID].colorYsum, cG);
+    InterlockedAdd(_AccumBuffer[blockID].colorZsum, cB);
+
+    InterlockedAdd(_AccumBuffer[blockID].count, 1u);
+
+    float depth = dot(position.xyz - _CameraPos, _CameraForward);
+    float shifted = depth + 100000.0f;
+    uint depthU = asuint(shifted);
+    InterlockedMin(_AccumBuffer[blockID].minZ, depthU);
+
+    uint enemyId = (uint)round(position.w);
+    InterlockedAdd(_AccumBuffer[blockID].idSum, enemyId);
+}
+
+[numthreads(8,1,1)]
+void AliveBlocks (uint3 id : SV_DispatchThreadID)
+{
+    uint blockCount = (uint)(_BlockSize * _BlockSize);
+    uint idx = id.x;
+    if (idx >= blockCount) return;
+
+    AccumalatorData data = _AccumBuffer[idx];
+
+    if (data.count == 0)return;
+
+    float invCount = 1.0 / (float)data.count;
+    float avgEncX = (float)data.posXSum * invCount;
+    float avgEncY = (float)data.posYSum * invCount;
+    float avgEncZ = (float)data.posZSum * invCount;
+
+    float avgX = avgEncX / 100000.0f - 512.0f;
+    float avgY = avgEncY / 100000.0f - 512.0f;
+    float avgZ = avgEncZ / 100000.0f - 512.0f;
+    float3 avgWorldPos = float3(avgX, avgY, avgZ);
+
+    float minDepth = asfloat(data.minZ) - 100000.0f;
+    // avgWorldPos.z = minDepth;
+
+    // average color
+    float3 avgColor = float3(data.colorXsum, data.colorYsum, data.colorZsum) * (invCount / 255.0);
+    avgColor = saturate(avgColor);
+
+    float dist = length(avgWorldPos - _CameraPos);
+    float worldPerPixel = 2.0 * dist * tan(_VerticalFOV * 0.5) / _TexSize.y;
+    float blockWorldX = worldPerPixel * (_TexSize.x / _BlockSize);
+    float blockWorldY = worldPerPixel * (_TexSize.y / _BlockSize);
+    float cubeScale = max(blockWorldX, blockWorldY);
+
+    CubeData c;
+    c.position = float4(avgWorldPos.xyz,1.0);
+    c.scale = float4(cubeScale.xxx,0);
+    c.color = float4(avgColor, 1.0);
+    c.uv = float2(0,0);
+    c.id = data.idSum / data.count;
+    c.padding = 0;
+
+    uint writeIndex;
+    InterlockedAdd(_AliveCounter[0], 1, writeIndex);
+    if (writeIndex >= (uint)(_BlockSize * _BlockSize)) return;
+    _AliveBuffer[writeIndex] = c;
+}
+[numthreads(8,1,1)]
+void TransferBlocks (uint3 id : SV_DispatchThreadID)
+{
+    // if (id.x == 0)
+    // _AliveCountSnapshot = _AliveCounter[0];
+//because threads do not know the final value as the can dealate elements from the buffer without knowing when starting
+//this syncs them before starting the kernel..so that each thrread will know the updated count in buffer
+//is needed because example the thread knows list count is 10 and it decreases 1 making it 9 but other might have already decrease it already
+//so this thread needs to sync the alive count before starting..so we use a groupshared variable to which every thread writes before deleating
+    // GroupMemoryBarrierWithGroupSync();
+
+    // uint aliveCount = _AliveCountSnapshot;
+    //so here we tell that if your about the substract the cube which is already substracted then return from here
+    //during atomic add makign a snapshot is not needed because every thread will just keep adding..
+    //but during substracting it matters because threads can work on already substracted index and copy garbage value 
+    uint aliveCount = _AliveCounter[0];
+    if (id.x >= aliveCount)
+        return;  
+        
+    CubeData c = _AliveBuffer[id.x];
+
+    if (c.id != _KillEnemyID)
+        return;
+    // int kill = id.x % 2;
+    // if (kill != 0) return;
+
+    //append oto dead buffer
+    uint deadIdx;
+    InterlockedAdd(_DeadCounter[0],1,deadIdx);
+
+    if (deadIdx >= _MAX_DEAD_CUBES)
+        return;
+
+    //impluse upwards force
+    float3 outward = normalize(c.position.xyz - _CameraPos);
+    float2 r = float2(
+        frac(sin((deadIdx + 1) * 12.9898) * 43758.5453),
+        frac(sin((deadIdx + 1) * 78.233)  * 43758.5453)
+    ) * 2.0 - 1.0;
+
+    float3 sideways = float3(r.x, 0, r.y);
+
+    float3 impulse =
+    outward * 4.0f +   // explode away from camera
+    float3(0, 5.0f, 0) + // upward kick (THIS is what you want)
+    sideways * 4.0f;   // spread
+
+    CubePhysicsData d;
+    d.position = c.position;
+    d.scale = c.scale;
+    d.color = c.color;
+    d.velocity = float4(impulse, 0);
+    _DeadBuffer[deadIdx] = d;
+
+
+    //Atomic substraction
+    uint lastIdx;
+    InterlockedAdd(_AliveCounter[0],-1,lastIdx); //this means that get the current count of alive cubes and decrease one return the number it decreased from
+    lastIdx -= 1;    //decrease the number to get the alive count
+    if(id.x < lastIdx)//if you are a thread that wanted to wrwite to the dealated index write to the n-1 index because list has shrunk
+    {
+        _AliveBuffer[id.x] = _AliveBuffer[lastIdx];
+    }    
+}
+[numthreads(8,1,1)]
+void CubePhysics (uint3 id : SV_DispatchThreadID)
+{
+    uint count = _DeadCounter[0];
+    if (id.x >= count) return;
+
+    CubePhysicsData cube = _DeadBuffer[id.x];
+
+    // integrate gravity
+    cube.velocity.xyz += _Gravity * _DeltaTime;
+    cube.position.xyz += cube.velocity.xyz * _DeltaTime;
+
+    float groundY = 0.05f;
+    float restitution = 0.35f;
+    float friction    = 0.6f;
+
+    float minBounceVel = 0.8f;
+    float minSlideVel  = 0.05f;
+
+    if (cube.position.y <= groundY)
+    {
+        cube.position.y = groundY;
+
+        if (cube.velocity.y < -minBounceVel)
+        {
+            cube.velocity.y = -cube.velocity.y * restitution;
+
+            float impact = abs(cube.velocity.y);
+            float2 randDir = normalize(float2(
+                frac(sin((id.x + 1) * 12.9898) * 43758.5453),
+                frac(sin((id.x + 1) * 78.233)  * 43758.5453)
+            ) * 2.0 - 1.0);
+
+            cube.velocity.xz += randDir * impact * 0.4f;
+        }
+        else
+        {
+            cube.velocity.y = 0.0f;
+        }
+        cube.velocity.xz *= friction;
+        if (length(cube.velocity.xz) < minSlideVel)
+            cube.velocity.xz = 0.0f;
+    }
+
+    cube.velocity.xyz *= _Damping;
+    _DeadBuffer[id.x] = cube;
+}
+
+
